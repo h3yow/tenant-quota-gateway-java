@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "tenants": {
+    "tenant-a": {
+      "rateCapacity": 10,
+      "rateRefillPerSecond": 1.0,
+      "quotaLimit": 5,
+      "quotaWindowSeconds": 60
+    },
+    "tenant-b": {
+      "rateCapacity": 2,
+      "rateRefillPerSecond": 0.5,
+      "quotaLimit": 3,
+      "quotaWindowSeconds": 60
+    }
+  }
+}
