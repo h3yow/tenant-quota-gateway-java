@@ -34,6 +34,15 @@ public class GatewayProperties {
     /** 是否允许通过 POST /admin/policies/reload 手动刷新策略。 */
     private boolean adminEndpointsEnabled = true;
 
+    /** 预占占用的最长保留时长（毫秒），超时自动释放；必须为正。 */
+    private long reservationTtlMillis = 15 * 60 * 1000L;
+
+    /** 后台超时扫描间隔（毫秒）；<=0 表示关闭后台扫描（仍有惰性释放保证正确）。 */
+    private long reservationSweepIntervalMillis = 10_000L;
+
+    /** 已结算/已失效预占记录的保留时长（毫秒），用于迟到/重复结算的去重判定。 */
+    private long reservationRecordTtlMillis = 24 * 60 * 60 * 1000L;
+
     public String getTenantHeader() { return tenantHeader; }
     public void setTenantHeader(String tenantHeader) { this.tenantHeader = tenantHeader; }
 
@@ -64,5 +73,22 @@ public class GatewayProperties {
     public boolean isAdminEndpointsEnabled() { return adminEndpointsEnabled; }
     public void setAdminEndpointsEnabled(boolean adminEndpointsEnabled) {
         this.adminEndpointsEnabled = adminEndpointsEnabled;
+    }
+
+    public long getReservationTtlMillis() { return reservationTtlMillis; }
+    public void setReservationTtlMillis(long reservationTtlMillis) {
+        this.reservationTtlMillis = reservationTtlMillis;
+    }
+
+    public long getReservationSweepIntervalMillis() {
+        return reservationSweepIntervalMillis;
+    }
+    public void setReservationSweepIntervalMillis(long reservationSweepIntervalMillis) {
+        this.reservationSweepIntervalMillis = reservationSweepIntervalMillis;
+    }
+
+    public long getReservationRecordTtlMillis() { return reservationRecordTtlMillis; }
+    public void setReservationRecordTtlMillis(long reservationRecordTtlMillis) {
+        this.reservationRecordTtlMillis = reservationRecordTtlMillis;
     }
 }

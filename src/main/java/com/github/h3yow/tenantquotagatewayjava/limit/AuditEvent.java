@@ -33,6 +33,12 @@ public record AuditEvent(
         /** 策略被刷新。 */
         POLICY_CHANGE,
         /** 降级路径被触发。 */
-        DEGRADATION
+        DEGRADATION,
+        /** 预占被接受（额度被占用）。 */
+        RESERVATION,
+        /** 预占被结算（退回/补扣/恰好/关闭窗口记账）。 */
+        SETTLEMENT,
+        /** 预占超时自动释放。 */
+        RESERVATION_EXPIRED
     }
 }

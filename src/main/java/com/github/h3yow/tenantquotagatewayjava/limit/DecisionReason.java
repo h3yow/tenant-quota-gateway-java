@@ -14,6 +14,9 @@ public enum DecisionReason {
     /** 请求缺少租户标识。 */
     MISSING_TENANT(false, 400),
 
+    /** 请求参数非法（如预占标识缺失、预占用量小于 1）。 */
+    INVALID_REQUEST(false, 400),
+
     /** 租户没有任何生效策略（未配置）。 */
     UNKNOWN_TENANT(false, 403),
 

@@ -12,6 +12,12 @@
       "rateRefillPerSecond": 0.5,
       "quotaLimit": 3,
       "quotaWindowSeconds": 60
+    },
+    "tenant-async": {
+      "rateCapacity": 100,
+      "rateRefillPerSecond": 100.0,
+      "quotaLimit": 20,
+      "quotaWindowSeconds": 3600
     }
   }
 }

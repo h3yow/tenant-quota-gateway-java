@@ -36,6 +36,11 @@ public class QuotaLimitEngine {
     private final boolean failOpen;
     private final long idempotencyTtlMillis;
 
+    /** 预占超时（占用最长保留时长）。 */
+    private final long reservationTtlMillis;
+    /** 已结束预占记录（结算/失效）的保留时长，用于重复结算去重。 */
+    private final long reservationRecordTtlMillis;
+
     /** 租户状态表：仅在首次出现租户时放入，之后原地更新，策略刷新不清理用量。 */
     private final ConcurrentHashMap<String, TenantState> tenantStates = new ConcurrentHashMap<>();
 
@@ -48,11 +53,20 @@ public class QuotaLimitEngine {
 
     public QuotaLimitEngine(PolicyProvider policyProvider, DefaultAuditLogger auditLogger, Clock clock,
                             boolean failOpen, long idempotencyTtlMillis) {
+        this(policyProvider, auditLogger, clock, failOpen, idempotencyTtlMillis,
+                15 * 60 * 1000L, 24 * 60 * 60 * 1000L);
+    }
+
+    public QuotaLimitEngine(PolicyProvider policyProvider, DefaultAuditLogger auditLogger, Clock clock,
+                            boolean failOpen, long idempotencyTtlMillis,
+                            long reservationTtlMillis, long reservationRecordTtlMillis) {
         this.policyProvider = policyProvider;
         this.auditLogger = auditLogger;
         this.clock = clock;
         this.failOpen = failOpen;
         this.idempotencyTtlMillis = Math.max(0L, idempotencyTtlMillis);
+        this.reservationTtlMillis = Math.max(1L, reservationTtlMillis);
+        this.reservationRecordTtlMillis = Math.max(0L, reservationRecordTtlMillis);
     }
 
     /**
@@ -260,14 +274,247 @@ public class QuotaLimitEngine {
             view.put("tenantId", state.tenantId());
             view.put("tokens", state.currentTokens());
             view.put("quotaUsed", state.quotaUsed());
+            view.put("quotaHeld", state.quotaHeld());
+            view.put("reservationCount", state.reservationCount());
             view.put("windowStartEpochMilli", state.windowStartEpochMilli());
         }
         return Optional.of(view);
     }
 
+    // ===== 预占 / 结算（先占用、后结算） =====
+
+    /**
+     * 申请预占：通过速率+配额闸门后占用 estimatedAmount 个配额并放行，占用部分在结算或
+     * 超时前对其他请求不可用。同一 reservationId 的重复提交只占用一次（幂等重放）。
+     */
+    public Reservation reserve(String requestId, String tenantId, String reservationId,
+                               long estimatedAmount) {
+        if (tenantId == null || tenantId.isBlank()) {
+            return reservationDenied(requestId, null, reservationId, estimatedAmount,
+                    DecisionReason.MISSING_TENANT, null, -1, -1, -1, 0,
+                    "预占请求缺少租户标识，无法匹配任何策略");
+        }
+        tenantId = tenantId.trim();
+        if (reservationId == null || reservationId.isBlank()) {
+            return reservationDenied(requestId, tenantId, null, estimatedAmount,
+                    DecisionReason.INVALID_REQUEST, null, -1, -1, -1, 0,
+                    "预占请求缺少 reservationId，无法标识同一笔异步业务");
+        }
+        reservationId = reservationId.trim();
+        if (estimatedAmount < 1L) {
+            return reservationDenied(requestId, tenantId, reservationId, estimatedAmount,
+                    DecisionReason.INVALID_REQUEST, null, -1, -1, -1, 0,
+                    "预估用量必须 >= 1，收到 " + estimatedAmount);
+        }
+
+        final PolicySnapshot snapshot;
+        try {
+            snapshot = policyProvider.currentSnapshot();
+        } catch (RuntimeException e) {
+            return reserveDegraded(requestId, tenantId, reservationId, estimatedAmount, null,
+                    "策略不可用: " + e.getMessage());
+        }
+        if (snapshot == null) {
+            return reserveDegraded(requestId, tenantId, reservationId, estimatedAmount, null,
+                    "策略快照为空");
+        }
+        TenantPolicy policy = snapshot.policyOf(tenantId);
+        if (policy == null) {
+            return reservationDenied(requestId, tenantId, reservationId, estimatedAmount,
+                    DecisionReason.UNKNOWN_TENANT, snapshot.version(), -1, -1, -1, 0,
+                    "租户在策略版本 v" + snapshot.version() + " 中不存在");
+        }
+
+        try {
+            TenantState state = tenantStates.computeIfAbsent(tenantId, t -> new TenantState(t,
+                    clock.now().toEpochMilli()));
+            long now = clock.now().toEpochMilli();
+            TenantState.ReserveOutcome outcome;
+            synchronized (state) {
+                outcome = state.tryReserve(policy, snapshot.version(), now, reservationId,
+                        requestId, estimatedAmount, reservationTtlMillis,
+                        reservationRecordTtlMillis);
+            }
+
+            Reservation reservation = new Reservation(requestId, tenantId, reservationId,
+                    outcome.reason(), estimatedAmount, snapshot.version(),
+                    outcome.rateRemaining(), outcome.quotaRemaining(), policy.quotaLimit(),
+                    outcome.heldTotal(), outcome.expiresAtEpochMilli(),
+                    outcome.retryAfterMillis(), outcome.basis());
+
+            if (outcome.reason() == DecisionReason.ALLOWED) {
+                auditLogger.log(auditLogger.newEvent(AuditEvent.Kind.RESERVATION, requestId,
+                        tenantId, DecisionReason.ALLOWED, snapshot.version(),
+                        "预占成功 reservationId=" + reservationId + " 占用=" + estimatedAmount
+                                + " 在途占用合计=" + outcome.heldTotal() + " 剩余可放行="
+                                + outcome.quotaRemaining() + " 失效时刻="
+                                + outcome.expiresAtEpochMilli()));
+                return reservation;
+            }
+            if (outcome.reason() == DecisionReason.IDEMPOTENT_REPLAY) {
+                auditLogger.log(auditLogger.newEvent(AuditEvent.Kind.RESERVATION, requestId,
+                        tenantId, DecisionReason.IDEMPOTENT_REPLAY, snapshot.version(),
+                        outcome.basis()));
+                return reservation;
+            }
+            auditLogger.log(auditLogger.newEvent(AuditEvent.Kind.DENY, requestId, tenantId,
+                    outcome.reason(), snapshot.version(), outcome.basis()));
+            return reservation;
+        } catch (RuntimeException e) {
+            return reserveDegraded(requestId, tenantId, reservationId, estimatedAmount,
+                    snapshot.version(),
+                    "租户计量状态异常: " + e.getClass().getSimpleName() + " " + e.getMessage());
+        }
+    }
+
+    private Reservation reserveDegraded(String requestId, String tenantId, String reservationId,
+                                        long estimatedAmount, Long version, String detail) {
+        DecisionReason reason = failOpen ? DecisionReason.ALLOWED : DecisionReason.DEGRADED_DENY;
+        String basis = "降级(" + (failOpen ? "fail-open 放行" : "fail-closed 拒绝")
+                + "): " + detail;
+        auditLogger.log(auditLogger.newEvent(AuditEvent.Kind.DEGRADATION, requestId, tenantId,
+                reason, version, basis));
+        return new Reservation(requestId, tenantId, reservationId, reason, estimatedAmount,
+                version, -1, -1, -1, 0, 0, 0, basis);
+    }
+
+    private Reservation reservationDenied(String requestId, String tenantId, String reservationId,
+                                          long estimatedAmount, DecisionReason reason,
+                                          Long version, long rateRemaining, long quotaRemaining,
+                                          long quotaLimit, long retryAfter, String basis) {
+        auditLogger.log(auditLogger.newEvent(AuditEvent.Kind.DENY, requestId, tenantId, reason,
+                version, basis));
+        return new Reservation(requestId, tenantId, reservationId, reason, estimatedAmount,
+                version, rateRemaining, quotaRemaining, quotaLimit, 0L, 0L, retryAfter, basis);
+    }
+
+    /**
+     * 按真实用量结算一笔预占：占多退回、占少补扣；重复/乱序/超时/关闭窗口各有可区分的
+     * 结局，同一笔业务的结算只真正生效一次。
+     */
+    public Settlement settleReservation(String requestId, String tenantId, String reservationId,
+                                        long actualAmount) {
+        if (tenantId == null || tenantId.isBlank()) {
+            return settlementProblem(requestId, null, reservationId, actualAmount,
+                    SettlementStatus.SETTLEMENT_INVALID, null, 0, -1, -1,
+                    "结算请求缺少租户标识");
+        }
+        tenantId = tenantId.trim();
+        if (reservationId == null || reservationId.isBlank()) {
+            return settlementProblem(requestId, tenantId, null, actualAmount,
+                    SettlementStatus.SETTLEMENT_INVALID, null, 0, -1, -1,
+                    "结算请求缺少 reservationId");
+        }
+        reservationId = reservationId.trim();
+        if (actualAmount < 0L) {
+            return settlementProblem(requestId, tenantId, reservationId, actualAmount,
+                    SettlementStatus.SETTLEMENT_INVALID, null, 0, -1, -1,
+                    "实际用量不能为负，收到 " + actualAmount);
+        }
+
+        final PolicySnapshot snapshot;
+        try {
+            snapshot = policyProvider.currentSnapshot();
+        } catch (RuntimeException e) {
+            return settleDegraded(requestId, tenantId, reservationId, actualAmount,
+                    "策略不可用: " + e.getMessage());
+        }
+        if (snapshot == null) {
+            return settleDegraded(requestId, tenantId, reservationId, actualAmount, "策略快照为空");
+        }
+        TenantPolicy policy = snapshot.policyOf(tenantId);
+        if (policy == null) {
+            return settlementProblem(requestId, tenantId, reservationId, actualAmount,
+                    SettlementStatus.SETTLEMENT_NOT_FOUND, snapshot.version(), 0, -1, -1,
+                    "租户在策略版本 v" + snapshot.version() + " 中不存在，无法定位预占");
+        }
+
+        TenantState state = tenantStates.get(tenantId);
+        if (state == null) {
+            Settlement notFound = settlementProblem(requestId, tenantId, reservationId,
+                    actualAmount, SettlementStatus.SETTLEMENT_NOT_FOUND, snapshot.version(), 0,
+                    policy.quotaLimit(), policy.quotaLimit(),
+                    "预占不存在: reservationId=" + reservationId + "（该租户尚无任何预占）");
+            return notFound;
+        }
+
+        try {
+            long now = clock.now().toEpochMilli();
+            TenantState.SettleOutcome outcome;
+            synchronized (state) {
+                outcome = state.settle(policy, snapshot.version(), now, reservationId,
+                        actualAmount, reservationRecordTtlMillis);
+            }
+            Settlement settlement = new Settlement(requestId, tenantId, reservationId,
+                    outcome.status(), outcome.reservedAmount(), actualAmount, outcome.delta(),
+                    outcome.settledUsed(), outcome.windowPolicyVersion(),
+                    outcome.quotaRemaining(), outcome.quotaLimit(), outcome.basis());
+
+            auditLogger.log(auditLogger.newEvent(AuditEvent.Kind.SETTLEMENT, requestId, tenantId,
+                    null, outcome.windowPolicyVersion(),
+                    "结算 reservationId=" + reservationId + " 结果=" + outcome.status()
+                            + " 预占=" + outcome.reservedAmount() + " 实际=" + actualAmount
+                            + " 调整=" + outcome.delta() + " 依据: " + outcome.basis()));
+            return settlement;
+        } catch (RuntimeException e) {
+            return settleDegraded(requestId, tenantId, reservationId, actualAmount,
+                    "租户计量状态异常: " + e.getClass().getSimpleName() + " " + e.getMessage());
+        }
+    }
+
+    private Settlement settleDegraded(String requestId, String tenantId, String reservationId,
+                                      long actualAmount, String detail) {
+        String basis = "降级(fail-closed 拒绝结算): " + detail
+                + "；结算未生效，业务可在配置恢复后用相同 reservationId 安全重试";
+        auditLogger.log(auditLogger.newEvent(AuditEvent.Kind.DEGRADATION, requestId, tenantId,
+                DecisionReason.DEGRADED_DENY, null, basis));
+        return new Settlement(requestId, tenantId, reservationId,
+                SettlementStatus.SETTLEMENT_DEGRADED, 0L, actualAmount, 0L, 0L, null, -1L, -1L,
+                basis);
+    }
+
+    private Settlement settlementProblem(String requestId, String tenantId, String reservationId,
+                                         long actualAmount, SettlementStatus status,
+                                         Long version, long reservedAmount, long quotaRemaining,
+                                         long quotaLimit, String basis) {
+        AuditEvent.Kind kind = status == SettlementStatus.SETTLEMENT_INVALID
+                ? AuditEvent.Kind.DENY : AuditEvent.Kind.SETTLEMENT;
+        auditLogger.log(auditLogger.newEvent(kind, requestId, tenantId, null, version,
+                "结算 reservationId=" + reservationId + " 结果=" + status + " 依据: " + basis));
+        return new Settlement(requestId, tenantId, reservationId, status, reservedAmount,
+                actualAmount, 0L, 0L, version, quotaRemaining, quotaLimit, basis);
+    }
+
+    /**
+     * 主动扫描全部租户，释放已超时的在途预占并审计。返回被释放的预占总数。
+     * 正确性别名：每次预占/结算/普通判定进入租户锁时也会惰性执行同样的释放。
+     */
+    public int sweepExpiredReservations() {
+        long now = clock.now().toEpochMilli();
+        int released = 0;
+        for (Map.Entry<String, TenantState> entry : tenantStates.entrySet()) {
+            String tenantId = entry.getKey();
+            TenantState state = entry.getValue();
+            java.util.List<ReservationRecord> expired;
+            synchronized (state) {
+                expired = state.sweepExpired(now, reservationRecordTtlMillis);
+            }
+            for (ReservationRecord r : expired) {
+                released++;
+                auditLogger.log(auditLogger.newEvent(AuditEvent.Kind.RESERVATION_EXPIRED,
+                        null, tenantId, null, r.windowPolicyVersion(),
+                        "预占超时自动释放 reservationId=" + r.reservationId()
+                                + " 首次请求=" + r.firstRequestId() + " 占用=" + r.amount()
+                                + " 创建于=" + r.createdAtEpochMilli() + " 失效于="
+                                + r.expiresAtEpochMilli() + "（超时TTL="
+                                + reservationTtlMillis + "ms）；已正常结算的业务不受影响"));
+            }
+        }
+        return released;
+    }
+
     /** 管理端：主动触发策略刷新并审计变更。 */
-    public PolicySnapshot reloadPolicies() {
-        // 先在替换前读取旧版本，保证审计依据准确
+    public PolicySnapshot reloadPolicies() {        // 先在替换前读取旧版本，保证审计依据准确
         PolicySnapshot previous;
         try {
             previous = policyProvider.currentSnapshot();
