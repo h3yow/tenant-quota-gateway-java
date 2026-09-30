@@ -28,6 +28,9 @@ public class GatewayProperties {
     /** 幂等键记录保留时长（毫秒）。 */
     private long idempotencyTtlMillis = 24 * 60 * 60 * 1000L;
 
+    /** 预占占用的超时时长（毫秒）：到期未结算自动释放占用。 */
+    private long reservationTtlMillis = 5 * 60 * 1000L;
+
     /** 内存审计记录保留条数。 */
     private int auditBufferSize = 1000;
 
@@ -56,6 +59,11 @@ public class GatewayProperties {
     public long getIdempotencyTtlMillis() { return idempotencyTtlMillis; }
     public void setIdempotencyTtlMillis(long idempotencyTtlMillis) {
         this.idempotencyTtlMillis = idempotencyTtlMillis;
+    }
+
+    public long getReservationTtlMillis() { return reservationTtlMillis; }
+    public void setReservationTtlMillis(long reservationTtlMillis) {
+        this.reservationTtlMillis = reservationTtlMillis;
     }
 
     public int getAuditBufferSize() { return auditBufferSize; }

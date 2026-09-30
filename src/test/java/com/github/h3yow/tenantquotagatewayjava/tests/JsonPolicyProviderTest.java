@@ -157,7 +157,7 @@ class JsonPolicyProviderTest {
                 "classpath:policies.json", Clock.system());
         PolicySnapshot snapshot = p.currentSnapshot();
         assertTrue(snapshot.version() >= 1);
-        assertEquals(2, snapshot.policies().size());
+        assertEquals(3, snapshot.policies().size());
         System.out.println("[策略加载] 默认 policies.json 加载成功: 租户数="
                 + snapshot.policies().size());
     }

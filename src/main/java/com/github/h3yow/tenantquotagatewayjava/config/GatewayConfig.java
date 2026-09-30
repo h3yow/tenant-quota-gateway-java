@@ -36,6 +36,7 @@ public class GatewayConfig {
                                              DefaultAuditLogger auditLogger, Clock clock,
                                              GatewayProperties properties) {
         return new QuotaLimitEngine(policyProvider, auditLogger, clock,
-                properties.isFailOpen(), properties.getIdempotencyTtlMillis());
+                properties.isFailOpen(), properties.getIdempotencyTtlMillis(),
+                properties.getReservationTtlMillis());
     }
 }

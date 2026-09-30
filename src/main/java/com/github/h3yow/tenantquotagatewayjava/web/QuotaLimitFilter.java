@@ -39,6 +39,18 @@ public class QuotaLimitFilter extends OncePerRequestFilter {
         this.properties = properties;
     }
 
+    /**
+     * 预占/结算是独立的两阶段计量端点，由 {@link ReservationController} 直接调用
+     * {@code reserve/settle}，不能再走一次性判定（否则会被重复计量）。
+     */
+    @Override
+    protected boolean shouldNotFilter(HttpServletRequest request) {
+        String uri = request.getRequestURI();
+        return uri != null
+                && (uri.endsWith("/api/quotas/reservations")
+                    || uri.endsWith("/api/quotas/settlements"));
+    }
+
     @Override
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response,
                                     FilterChain filterChain)

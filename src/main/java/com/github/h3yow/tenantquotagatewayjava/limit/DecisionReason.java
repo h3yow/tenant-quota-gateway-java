@@ -24,7 +24,28 @@ public enum DecisionReason {
     QUOTA_EXHAUSTED(false, 429),
 
     /** 降级策略为 fail-closed，因内部状态/配置不可用而拒绝。 */
-    DEGRADED_DENY(false, 503);
+    DEGRADED_DENY(false, 503),
+
+    /** 预占成功：已按预估用量占用配额（同时扣减 1 个速率令牌）。 */
+    RESERVED(true, 200),
+
+    /** 结算成功：已按真实用量多退少补。 */
+    SETTLED(true, 200),
+
+    /** 预占/结算的幂等重放：同一预占键的重复提交，未重复占用或计费。 */
+    RESERVATION_REPLAY(true, 200),
+
+    /** 请求参数非法（如预估/真实用量小于 1）。 */
+    INVALID_ARGUMENT(false, 400),
+
+    /** 结算引用了不存在的预占键（从未成功预占，或记录已过保留期清理）。 */
+    RESERVATION_NOT_FOUND(false, 404),
+
+    /** 预占已超时自动释放，迟到的结算不再生效（不能对失效占用计费）。 */
+    RESERVATION_EXPIRED(false, 409),
+
+    /** 预占键已处于终态（已结算或已过期），不能再用它发起新预占。 */
+    RESERVATION_CLOSED(false, 409);
 
     private final boolean allowed;
     private final int httpStatus;
