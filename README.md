@@ -61,15 +61,38 @@
 
 #### 占用超时自动释放
 
-- 占住却迟迟等不到结算（业务失败、调用方挂掉）时，占用不会一直挂着：每笔预占带一个确定的
-  绝对过期时刻 `reservedAt + reservation-ttl-millis`（默认 5 分钟）。判定边界确定：
-  **`now >= expiresAt` 即失效**。
-- 过期是**惰性扫描**：该租户下一次任意计量操作（预占/结算/普通判定）进入租户锁时，先把
-  到期占用标记为 `EXPIRED` 并把占用量退回当前窗口，再做本次判定；每笔释放写一条
-  `RESERVATION_EXPIRED` 审计。
-- 失效后旧占用不再是有效额度：迟到的结算返回 409 `RESERVATION_EXPIRED`，不会对已释放的
-  占用再次计费，需要时业务方应重新预占。**已经正常结算过的业务不受超时扫描影响**——超时只
-  作用于仍处于 `ACTIVE` 的记录。
+- **超时怎么算**：每笔预占带一个确定的绝对过期时刻 `reservedAt + reservation-ttl-millis`
+  （默认 5 分钟），判定边界确定：**`now >= expiresAt` 即失效**，与用哪个时钟无关、无歧义。
+- **没有后续请求也会自动释放（后台巡检）**：网关内置一个守护线程巡检器
+  （`ReservationReaper`，节奏由 `reservation-reaper-interval-millis` 配置，默认 1 秒），
+  按固定延迟遍历所有出现过的租户，在**各自的租户锁内**做"只维护不扣减"：一旦到点，
+  仍处于 `ACTIVE` 的占用立即标记为 `EXPIRED`，占用量**退回当前配额窗口**。
+  因此即使该租户预占后业务失败、调用方挂掉、**此后再没有任何请求**，最迟
+  `TTL + 一个巡检间隔` 后额度也会自动还回来，不必等下一次请求顺带清理。
+- **释放后额度与记录的表现**：释放后该笔占用不再计入窗口已用量，`quotaUsed` 回落、
+  `activeReservationCount`/`activeReservedAmount` 归零，退回的额度在当前窗口立即可被
+  其它预占/普通请求使用。每笔释放写一条独立、可区分的 `RESERVATION_EXPIRED` 审计
+  （可在 `/admin/audit` 查看），记录中可看出：是**哪笔预占**（预占键、首次预占
+  requestId）、**放回了多少**（占用量）、预占/到期/实际释放时刻、以及**触发来源**
+  （后台巡检 `scheduled-reaper` / 业务请求顺带 / 管理端查看 `admin-view:<租户>`）。
+- **管理端查看始终自洽**：`GET /admin/tenants/{tenantId}` 在返回前也会在租户锁内先做
+  一次同样的超时维护再读数，因此即使巡检线程恰好尚未跑到、租户也无后续请求，管理员看到的
+  "已用量"与"在途占用"两个数也始终自洽（不会出现在途已为 0、已用量却还把它算成已用的
+  情况）；查看顺带触发的释放同样写审计（触发来源标为管理端查看）。
+- **对已结算业务的影响（恰好一次，互不误伤）**：
+  - 已失效的占用**不能再被当成有效额度**参与后续判定；它迟到的结算返回 **409
+    `RESERVATION_EXPIRED`** 被明确挡掉，**不会对已还回去的额度重复计费**（需要继续用
+    额度时业务方应重新预占）；重复迟到的结算仍是同一拒绝原因。
+  - **已经正常结算完成的业务不会被超时逻辑误伤**：超时只作用于仍处于 `ACTIVE` 的记录，
+    `SETTLED` 是终态；对已结算业务重复提交的结算仍只返回 `RESERVATION_REPLAY`（携带首次
+    结算 requestId 与首次真实用量），真正生效永远只有一次，窗口用量不被多扣。
+- **释放方式有两条且共用同一把锁**：除上述后台巡检外，业务请求（预占/结算/普通判定）
+  进入租户锁时仍会顺带做一次到期扫描（惰性兜底），管理端查看也会顺带维护。三者调用的是
+  租户锁内**同一个状态迁移**（`ACTIVE → EXPIRED` 与退回用量原子完成），因此：
+  - 巡检与并发请求互斥，**同一笔占用绝不会被释放两次**，重复跑巡检不产生第二条记录；
+  - 释放与额度判定不会把同一份额度重复使用，并发下放行总量严格不超过窗口上限；
+  - 把 `reservation-reaper-interval-millis` 设为 `<=0` 可关闭后台线程，退化为仅靠请求/
+    管理端顺带清理的惰性模式（不建议在生产关闭）。
 
 #### 窗口滚动与策略刷新期间的在途占用
 
@@ -153,6 +176,7 @@
 | `fail-open` | `false` | 降级策略：false=拒绝，true=放行 |
 | `idempotency-ttl-millis` | `86400000` | 幂等成功记录保留时长（同时是预占终态记录保留时长） |
 | `reservation-ttl-millis` | `300000` | 预占占用超时：到期未结算自动释放，迟到结算被拒 |
+| `reservation-reaper-interval-millis` | `1000` | 超时自动释放的后台巡检节奏（毫秒）；到点占用无需后续请求即释放，`<=0` 关闭后台巡检 |
 | `audit-buffer-size` | `1000` | 内存审计记录保留条数 |
 | `admin-endpoints-enabled` | `true` | 是否开放 `/admin` 接口 |
 
@@ -188,7 +212,7 @@
 前置：JDK 21+、Maven 3.9+。
 
 ```bash
-# 运行全部测试（25 个，含并发/刷新/重试/降级与预占-结算场景，输出含 requestId 与判定依据）
+# 运行全部测试（32 个，含并发/刷新/重试/降级、预占-结算与超时自动释放场景，输出含 requestId 与判定依据）
 mvn test
 
 # 只跑某一类场景
@@ -196,6 +220,7 @@ mvn test -Dtest=TenantIsolationTest          # 租户隔离、临界额度、拒
 mvn test -Dtest=ConcurrentBurstTest          # 200 并发突发严格不超发
 mvn test -Dtest=IdempotencyTest              # 重复提交/并发同键/TTL
 mvn test -Dtest=ReservationSettlementTest    # 预占并发不超额/多退少补/重复乱序只一次/超时释放/刷新迁移
+mvn test -Dtest=ReservationReaperTest        # 无请求自动释放并留痕/迟到结算被拒已结算不受影响/并发不双释放不超发/后台线程
 mvn test -Dtest=ReservationHttpTest          # 预占/结算 HTTP 端到端状态码与响应头
 mvn test -Dtest=PolicyRefreshTest            # 配置刷新不错乱、不丢用量
 mvn test -Dtest=DegradationTest              # fail-open/fail-closed 降级
@@ -225,6 +250,27 @@ curl -i -X POST localhost:8080/api/quotas/settlements \
 # 4) 再次结算：reason=RESERVATION_REPLAY（恰好一次，不重复计费）
 #    等待超过 reservation-ttl-millis 未结算的预占，再来结算会得到 409 RESERVATION_EXPIRED
 
+# —— 预占超时自动释放（无需租户再有任何请求）——
+# 用短 TTL + 短巡检节奏启动，便于本地观察（也可写进 application.properties）：
+mvn spring-boot:run -Dspring-boot.run.arguments=\
+"--tenant-quota.reservation-ttl-millis=5000,--tenant-quota.reservation-reaper-interval-millis=1000"
+# a) 预占 4 后不再发任何 /api 请求
+curl -i -X POST localhost:8080/api/quotas/reservations \
+  -H 'X-Tenant-Id: tenant-http' -H 'Idempotency-Key: job-lost' \
+  -H 'Content-Type: application/json' -d '{"estimated":4}'
+# b) 立刻看：quotaUsed=4, activeReservationCount=1, activeReservedAmount=4
+curl -s localhost:8080/admin/tenants/tenant-http | jq .
+# c) 等待约 6 秒（TTL 5s + 巡检 1s），期间不发任何业务请求；再看：
+#    quotaUsed 回落、activeReservationCount=0、activeReservedAmount=0（额度已自动回到窗口）
+curl -s localhost:8080/admin/tenants/tenant-http | jq .
+# d) 释放痕迹：出现一条独立的 RESERVATION_EXPIRED，含预占键 job-lost、首次请求、
+#    占用=4、到期/释放时刻、触发来源 scheduled-reaper
+curl -s 'localhost:8080/admin/audit' | jq '.[] | select(.kind=="RESERVATION_EXPIRED")'
+# e) 迟到结算被明确拒绝 409，且不重复计费
+curl -i -X POST localhost:8080/api/quotas/settlements \
+  -H 'X-Tenant-Id: tenant-http' -H 'Idempotency-Key: job-lost' \
+  -H 'Content-Type: application/json' -d '{"actual":4}'
+
 curl -s localhost:8080/admin/audit | jq .
 curl -s localhost:8080/admin/tenants/tenant-http | jq .   # 含 activeReservationCount/activeReservedAmount
 curl -s -X POST localhost:8080/admin/policies/reload
@@ -243,3 +289,9 @@ curl -s -X POST localhost:8080/admin/policies/reload
   两者），预占的"速率+配额"检查与占用、结算的多退少补、超时释放与窗口滚动全部在该锁内
   原子完成；预占键即幂等键，使重复预占/重复或乱序结算只生效一次；窗口滚动与配额维度
   刷新时在途占用改绑迁移，用量不消失、结算始终落在当前窗口与上限。
+- **超时自动释放一致性**：后台巡检线程（`ReservationReaper`）只负责"按节奏叫一次"，真正的
+  `ACTIVE → EXPIRED` 状态迁移与额度退回仍发生在每个租户自己的监视器锁内，与业务请求、
+  管理端查看调用的是**同一个锁内维护流程**。因此租户无任何后续请求时占用也会在
+  `TTL+一个巡检间隔` 内确定释放；巡检与并发判定天然互斥，同一笔占用不可能被释放两次、
+  释放后的额度不可能被重复使用导致超发；管理端查看在锁内先维护后读数，`quotaUsed` 与
+  `activeReservedAmount` 永远自洽。

@@ -332,6 +332,26 @@ final class TenantState {
         return Math.max(0L, policy.quotaLimit() - quotaUsed);
     }
 
+    /**
+     * 后台巡检 / 管理端查看时的维护入口：在租户锁内完成与预占/结算路径完全一致的前置维护
+     * （终态记录清理 → 到点占用超时释放 → 应用新策略 → 补充令牌 → 窗口滚动与在途占用迁移），
+     * 但不做任何速率/配额扣减，因此在租户没有任何业务请求时也能安全调用。
+     * 返回本次维护确定性失效并退回占用的记录列表（可能为空），由调用方写审计。
+     */
+    synchronized List<ReservationRecord> maintain(TenantPolicy policy, long policyVersion,
+                                                  long nowEpochMilli) {
+        return prepareLocked(policy, policyVersion, nowEpochMilli);
+    }
+
+    /**
+     * 策略快照暂时不可用时的兜底维护：缺少策略参数故不触碰令牌桶与窗口，
+     * 只执行终态清理与到点占用的确定性失效（{@code now >= expiresAt}），
+     * 保证“超时自动释放”不依赖策略文件可用。
+     */
+    synchronized List<ReservationRecord> maintainWithoutPolicy(long nowEpochMilli) {
+        return sweepExpired(nowEpochMilli);
+    }
+
     /** 当前配额窗口已用量（含在途占用，管理端查看）。 */
     synchronized long quotaUsed() {
         return quotaUsed;

@@ -24,6 +24,12 @@ import java.util.concurrent.TimeUnit;
  */
 public class QuotaLimitEngine {
 
+    /** 后台定时巡检自动释放占用时使用的合成 requestId，便于审计中识别释放来源。 */
+    public static final String REAPER_REQUEST_ID = "scheduled-reaper";
+
+    /** 管理端查看顺带做确定性清理时使用的合成 requestId 前缀（后接租户标识）。 */
+    public static final String ADMIN_SWEEP_REQUEST_ID = "admin-view:";
+
     /** 幂等存储中的占位条目：表示首个请求仍在判定中，并发重试在其上等待。 */
     private static final class InFlight {
         final CountDownLatch done = new CountDownLatch(1);
@@ -326,18 +332,90 @@ public class QuotaLimitEngine {
         return result;
     }
 
-    /** 把本次锁内顺带扫描出的超时预占逐条写审计（释放确定、可解释）。 */
+    /** 把本次锁内顺带扫描出的超时预占逐条写审计（由某业务请求在其租户锁内顺带触发）。 */
     private void auditExpired(String requestId, String tenantId,
                               List<ReservationRecord> expired) {
+        auditExpired(requestId, tenantId, expired, "业务请求 requestId=" + requestId + " 顺带触发");
+    }
+
+    /**
+     * 把一批确定性失效的预占逐条写审计，每条记录可单独识别：是哪笔预占、首次请求是谁、
+     * 占用多少、何时到期、何时释放、由谁触发，便于管理员核对“放回了多少”。
+     *
+     * @param triggerDescription 释放触发来源的说明（业务请求顺带 / 后台定时巡检 / 管理端查看）
+     */
+    private void auditExpired(String requestId, String tenantId,
+                              List<ReservationRecord> expired, String triggerDescription) {
         for (ReservationRecord r : expired) {
             String basis = "预占超时自动释放: 预占键=" + r.key() + " 首次请求 requestId="
-                    + r.reserveRequestId() + " 占用=" + r.amount() + " TTL="
-                    + reservationTtlMillis + "ms 到期未结算，占用已退回窗口; 状态=EXPIRED，"
-                    + "迟到结算将被拒绝(触发者 requestId=" + requestId + ")";
+                    + r.reserveRequestId() + " 占用=" + r.amount() + " 预占时刻="
+                    + r.reservedAtEpochMilli() + " 到期时刻=" + r.expiresAtEpochMilli()
+                    + "(reservedAt+TTL" + reservationTtlMillis + "ms)，实际释放="
+                    + r.settledAtEpochMilli() + "，占用已按确定规则(now>=expiresAt)退回当前窗口; "
+                    + "状态=EXPIRED，迟到结算将被拒绝(409 RESERVATION_EXPIRED)，触发来源: "
+                    + triggerDescription;
             auditLogger.log(auditLogger.newEvent(AuditEvent.Kind.RESERVATION_EXPIRED,
                     requestId, tenantId, DecisionReason.RESERVATION_EXPIRED, r.policyVersion(),
                     basis));
         }
+    }
+
+    /**
+     * 后台定时巡检执行一轮：遍历所有出现过的租户，在各自的租户锁内做“只维护不扣减”，
+     * 到点（{@code now >= expiresAt}）仍处于 ACTIVE 的占用被确定性失效并退回当前窗口。
+     *
+     * <p>与业务请求路径共用同一把租户锁、同一个 {@code prepareLocked} 维护流程，因此：</p>
+     * <ul>
+     *   <li>租户此后没有任何请求，占用也会在到点后的最近一轮巡检被释放，额度回到当前窗口；</li>
+     *   <li>状态迁移（ACTIVE→EXPIRED）与退回用量在锁内原子发生，巡检与并发请求不可能把同一笔
+     *       占用释放两次，也不会在释放后让额度被重复使用；</li>
+     *   <li>每笔释放写一条独立可区分的 {@code RESERVATION_EXPIRED} 审计。</li>
+     * </ul>
+     *
+     * @return 本轮实际释放的占用笔数（用于测试断言）
+     */
+    public int runReaperPass() {
+        return sweepNow(REAPER_REQUEST_ID, "后台定时巡检(" + REAPER_REQUEST_ID + ")");
+    }
+
+    /**
+     * 让所有租户的在途占用状态推进到 {@code now}：用于后台巡检与管理端查看。
+     * 每个租户独立加锁；策略快照不可用时退化为仅做超时清理，释放不依赖配置可读。
+     */
+    private int sweepNow(String triggerRequestId, String triggerDescription) {
+        long now = clock.now().toEpochMilli();
+        PolicySnapshot snapshot;
+        try {
+            snapshot = policyProvider.currentSnapshot();
+        } catch (RuntimeException e) {
+            snapshot = null;
+        }
+        int released = 0;
+        for (Map.Entry<String, TenantState> entry : tenantStates.entrySet()) {
+            String tenantId = entry.getKey();
+            TenantState state = entry.getValue();
+            try {
+                TenantPolicy policy = snapshot == null ? null : snapshot.policyOf(tenantId);
+                List<ReservationRecord> expired;
+                if (policy == null) {
+                    expired = state.maintainWithoutPolicy(now);
+                } else {
+                    expired = state.maintain(policy, snapshot.version(), now);
+                }
+                if (!expired.isEmpty()) {
+                    auditExpired(triggerRequestId, tenantId, expired, triggerDescription);
+                    released += expired.size();
+                }
+            } catch (RuntimeException e) {
+                // 单租户维护异常只跳过该租户，绝不能阻断其它租户到点释放
+                auditLogger.log(auditLogger.newEvent(AuditEvent.Kind.DEGRADATION,
+                        triggerRequestId, tenantId, DecisionReason.DEGRADED_DENY,
+                        snapshot == null ? null : snapshot.version(),
+                        "超时巡检维护租户 " + tenantId + " 时异常，已跳过该租户本轮: "
+                                + e.getClass().getSimpleName() + " " + e.getMessage()));
+            }
+        }
+        return released;
     }
 
     private ReservationResult reservationDegraded(String requestId, String tenantId, String key,
@@ -551,19 +629,43 @@ public class QuotaLimitEngine {
 
     /** 管理端：查看某租户当前计量状态（不存在返回空）。 */
     public Optional<Map<String, Object>> describeTenant(String tenantId) {
-        TenantState state = tenantStates.get(tenantId);
+        if (tenantId == null || tenantId.isBlank()) {
+            return Optional.empty();
+        }
+        TenantState state = tenantStates.get(tenantId.trim());
         if (state == null) {
             return Optional.empty();
         }
+        tenantId = tenantId.trim();
+        long now = clock.now().toEpochMilli();
+
+        // 先在租户锁内做与业务路径一致的维护（超时释放/窗口滚动），再读数。
+        // 这样即使租户之后再无任何业务请求、或后台巡检恰好尚未跑到，管理员看到的
+        // “已用量(quotaUsed)”与“在途占用(activeReservedAmount)”也始终自洽。
+        PolicySnapshot snapshot;
+        try {
+            snapshot = policyProvider.currentSnapshot();
+        } catch (RuntimeException e) {
+            snapshot = null;
+        }
+        TenantPolicy policy = snapshot == null ? null : snapshot.policyOf(tenantId);
+        List<ReservationRecord> expired;
         Map<String, Object> view = new LinkedHashMap<>();
         synchronized (state) {
-            long now = clock.now().toEpochMilli();
+            expired = policy == null
+                    ? state.maintainWithoutPolicy(now)
+                    : state.maintain(policy, snapshot.version(), now);
             view.put("tenantId", state.tenantId());
             view.put("tokens", state.currentTokens());
             view.put("quotaUsed", state.quotaUsed());
             view.put("windowStartEpochMilli", state.windowStartEpochMilli());
             view.put("activeReservationCount", state.activeReservationCount(now));
             view.put("activeReservedAmount", state.activeReservedAmount(now));
+        }
+        if (!expired.isEmpty()) {
+            String triggerId = ADMIN_SWEEP_REQUEST_ID + tenantId;
+            auditExpired(triggerId, tenantId, expired, "管理端查看租户状态顺带触发("
+                    + triggerId + ")");
         }
         return Optional.of(view);
     }

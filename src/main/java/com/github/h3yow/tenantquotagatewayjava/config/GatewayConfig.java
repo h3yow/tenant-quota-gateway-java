@@ -4,6 +4,7 @@ import com.github.h3yow.tenantquotagatewayjava.limit.Clock;
 import com.github.h3yow.tenantquotagatewayjava.limit.DefaultAuditLogger;
 import com.github.h3yow.tenantquotagatewayjava.limit.PolicyProvider;
 import com.github.h3yow.tenantquotagatewayjava.limit.QuotaLimitEngine;
+import com.github.h3yow.tenantquotagatewayjava.limit.ReservationReaper;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -38,5 +39,11 @@ public class GatewayConfig {
         return new QuotaLimitEngine(policyProvider, auditLogger, clock,
                 properties.isFailOpen(), properties.getIdempotencyTtlMillis(),
                 properties.getReservationTtlMillis());
+    }
+
+    @Bean
+    public ReservationReaper reservationReaper(QuotaLimitEngine engine,
+                                               GatewayProperties properties) {
+        return new ReservationReaper(engine, properties.getReservationReaperIntervalMillis());
     }
 }
