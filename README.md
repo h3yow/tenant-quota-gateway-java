@@ -64,12 +64,21 @@
 - 占住却迟迟等不到结算（业务失败、调用方挂掉）时，占用不会一直挂着：每笔预占带一个确定的
   绝对过期时刻 `reservedAt + reservation-ttl-millis`（默认 5 分钟）。判定边界确定：
   **`now >= expiresAt` 即失效**。
-- 过期是**惰性扫描**：该租户下一次任意计量操作（预占/结算/普通判定）进入租户锁时，先把
-  到期占用标记为 `EXPIRED` 并把占用量退回当前窗口，再做本次判定；每笔释放写一条
-  `RESERVATION_EXPIRED` 审计。
+- **到点自动释放，不等任何后续请求**：后台定时扫描器（`ReservationExpiryScheduler`）按
+  `reservation-sweep-interval-millis`（默认 1 秒）的间隔主动扫描全部租户，把到期占用标记为
+  `EXPIRED` 并把占用量退回当前窗口——即使该租户之后再没有任何请求，额度也会自动回落，
+  管理端看到的 `quotaUsed` 与 `activeReservedAmount` 始终自洽。扫描节奏只影响释放被发现的
+  早晚，不影响"是否释放、释放多少"的确定性结论（过期时刻在预占时已确定）。
+- 每笔释放都写一条 `RESERVATION_EXPIRED` 审计，**可区分、说得清**：记录包含预占键、首次
+  请求 requestId、放回量、TTL，以及释放来源——后台定时扫描（触发者标识
+  `auto-expiry-sweeper`）、请求进入租户锁时顺带扫描、或管理端查看时顺带扫描
+  （`GET /admin/tenants/{id}` 在读视图前也会在同一租户锁内先扫描，保证视图自洽）。
 - 失效后旧占用不再是有效额度：迟到的结算返回 409 `RESERVATION_EXPIRED`，不会对已释放的
   占用再次计费，需要时业务方应重新预占。**已经正常结算过的业务不受超时扫描影响**——超时只
-  作用于仍处于 `ACTIVE` 的记录。
+  作用于仍处于 `ACTIVE` 的记录，重复提交的结算仍只按首次结果幂等重放。
+- 并发安全：后台扫描与请求路径共用**同一把租户锁**、同一套过期规则，同一笔占用无论被哪条
+  路径先扫到都只释放一次（不会重复退回）；释放与同时到来的预占/结算/普通判定在锁内串行，
+  互不干扰，释放回的额度不会被重复使用导致超发。
 
 #### 窗口滚动与策略刷新期间的在途占用
 
@@ -153,6 +162,7 @@
 | `fail-open` | `false` | 降级策略：false=拒绝，true=放行 |
 | `idempotency-ttl-millis` | `86400000` | 幂等成功记录保留时长（同时是预占终态记录保留时长） |
 | `reservation-ttl-millis` | `300000` | 预占占用超时：到期未结算自动释放，迟到结算被拒 |
+| `reservation-sweep-interval-millis` | `1000` | 后台定时扫描超期预占的间隔：到期后无需后续请求即自动释放 |
 | `audit-buffer-size` | `1000` | 内存审计记录保留条数 |
 | `admin-endpoints-enabled` | `true` | 是否开放 `/admin` 接口 |
 
@@ -188,19 +198,21 @@
 前置：JDK 21+、Maven 3.9+。
 
 ```bash
-# 运行全部测试（25 个，含并发/刷新/重试/降级与预占-结算场景，输出含 requestId 与判定依据）
+# 运行全部测试（30 个，含并发/刷新/重试/降级与预占-结算场景，输出含 requestId 与判定依据）
 mvn test
 
 # 只跑某一类场景
-mvn test -Dtest=TenantIsolationTest          # 租户隔离、临界额度、拒绝原因区分
-mvn test -Dtest=ConcurrentBurstTest          # 200 并发突发严格不超发
-mvn test -Dtest=IdempotencyTest              # 重复提交/并发同键/TTL
-mvn test -Dtest=ReservationSettlementTest    # 预占并发不超额/多退少补/重复乱序只一次/超时释放/刷新迁移
-mvn test -Dtest=ReservationHttpTest          # 预占/结算 HTTP 端到端状态码与响应头
-mvn test -Dtest=PolicyRefreshTest            # 配置刷新不错乱、不丢用量
-mvn test -Dtest=DegradationTest              # fail-open/fail-closed 降级
-mvn test -Dtest=JsonPolicyProviderTest       # 策略加载/校验/原子替换
-mvn test -Dtest=WebEndToEndTest              # HTTP 端到端状态码与响应头
+mvn test -Dtest=TenantIsolationTest              # 租户隔离、临界额度、拒绝原因区分
+mvn test -Dtest=ConcurrentBurstTest              # 200 并发突发严格不超发
+mvn test -Dtest=IdempotencyTest                  # 重复提交/并发同键/TTL
+mvn test -Dtest=ReservationSettlementTest        # 预占并发不超额/多退少补/重复乱序只一次/超时释放/刷新迁移
+mvn test -Dtest=ReservationAutoExpiryTest        # 超时自动释放(不等后续请求)/迟到结算被拒/并发扫描不重复释放不超发
+mvn test -Dtest=ReservationAutoExpirySpringTest  # 真实定时调度器到点自动释放的端到端验证
+mvn test -Dtest=ReservationHttpTest              # 预占/结算 HTTP 端到端状态码与响应头
+mvn test -Dtest=PolicyRefreshTest                # 配置刷新不错乱、不丢用量
+mvn test -Dtest=DegradationTest                  # fail-open/fail-closed 降级
+mvn test -Dtest=JsonPolicyProviderTest           # 策略加载/校验/原子替换
+mvn test -Dtest=WebEndToEndTest                  # HTTP 端到端状态码与响应头
 
 # 启动应用后手工验证
 mvn spring-boot:run
@@ -224,6 +236,14 @@ curl -i -X POST localhost:8080/api/quotas/settlements \
   -d '{"actual":1}'
 # 4) 再次结算：reason=RESERVATION_REPLAY（恰好一次，不重复计费）
 #    等待超过 reservation-ttl-millis 未结算的预占，再来结算会得到 409 RESERVATION_EXPIRED
+
+# —— 超时自动释放（无需后续请求）本地验证 ——
+# 用小 TTL 启动（覆盖 application.properties）：
+#   mvn spring-boot:run -Dspring-boot.run.arguments="--tenant-quota.reservation-ttl-millis=5000 --tenant-quota.reservation-sweep-interval-millis=500"
+# 预占一笔后不再发任何请求，等 5 秒多一点：
+#   curl -s localhost:8080/admin/tenants/tenant-http | jq .   # quotaUsed 自动回落、activeReservedAmount=0
+#   curl -s localhost:8080/admin/audit | jq '.[] | select(.kind=="RESERVATION_EXPIRED")'
+#   # 审计中可见该笔释放：预占键、放回量、释放来源=后台定时扫描(auto-expiry-sweeper)
 
 curl -s localhost:8080/admin/audit | jq .
 curl -s localhost:8080/admin/tenants/tenant-http | jq .   # 含 activeReservationCount/activeReservedAmount

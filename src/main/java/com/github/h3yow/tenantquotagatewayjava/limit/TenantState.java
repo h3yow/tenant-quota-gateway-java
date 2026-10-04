@@ -228,6 +228,15 @@ final class TenantState {
     }
 
     /**
+     * 供后台定时扫描调用：在本租户锁内把到期未结算的占用置为 EXPIRED 并退回占用量，
+     * 返回本次释放的记录（可能为空）。与请求路径的惰性扫描共用同一套规则与同一把锁，
+     * 因此同一笔占用无论被哪条路径先扫到都只释放一次，已结算记录绝不受影响。
+     */
+    synchronized List<ReservationRecord> expireOverdueReservations(long nowEpochMilli) {
+        return sweepExpired(nowEpochMilli);
+    }
+
+    /**
      * 超时扫描：到达 TTL 仍未结算的在途占用自动失效，占用量退回当前窗口。
      * 已正常结算的记录不受影响。规则确定：{@code now >= expiresAt} 即失效。
      */

@@ -31,6 +31,9 @@ public class GatewayProperties {
     /** 预占占用的超时时长（毫秒）：到期未结算自动释放占用。 */
     private long reservationTtlMillis = 5 * 60 * 1000L;
 
+    /** 后台定时扫描超期预占的间隔（毫秒）：到期后无需任何后续请求即自动释放。 */
+    private long reservationSweepIntervalMillis = 1_000L;
+
     /** 内存审计记录保留条数。 */
     private int auditBufferSize = 1000;
 
@@ -64,6 +67,11 @@ public class GatewayProperties {
     public long getReservationTtlMillis() { return reservationTtlMillis; }
     public void setReservationTtlMillis(long reservationTtlMillis) {
         this.reservationTtlMillis = reservationTtlMillis;
+    }
+
+    public long getReservationSweepIntervalMillis() { return reservationSweepIntervalMillis; }
+    public void setReservationSweepIntervalMillis(long reservationSweepIntervalMillis) {
+        this.reservationSweepIntervalMillis = reservationSweepIntervalMillis;
     }
 
     public int getAuditBufferSize() { return auditBufferSize; }

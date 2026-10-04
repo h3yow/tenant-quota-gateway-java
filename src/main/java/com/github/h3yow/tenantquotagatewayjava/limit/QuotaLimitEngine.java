@@ -30,6 +30,9 @@ public class QuotaLimitEngine {
         volatile Decision decision;
     }
 
+    /** 后台定时扫描在审计中使用的固定触发者标识（区别于真实业务请求）。 */
+    private static final String AUTO_SWEEP_REQUEST_ID = "auto-expiry-sweeper";
+
     private final PolicyProvider policyProvider;
     private final DefaultAuditLogger auditLogger;
     private final Clock clock;
@@ -329,15 +332,48 @@ public class QuotaLimitEngine {
     /** 把本次锁内顺带扫描出的超时预占逐条写审计（释放确定、可解释）。 */
     private void auditExpired(String requestId, String tenantId,
                               List<ReservationRecord> expired) {
+        auditExpired(requestId, tenantId, expired, "请求进入租户锁时顺带扫描");
+    }
+
+    /** 逐条审计超时释放：来源（请求顺带/后台定时/管理端查看）写入依据，便于区分与追责。 */
+    private void auditExpired(String requestId, String tenantId,
+                              List<ReservationRecord> expired, String trigger) {
         for (ReservationRecord r : expired) {
             String basis = "预占超时自动释放: 预占键=" + r.key() + " 首次请求 requestId="
                     + r.reserveRequestId() + " 占用=" + r.amount() + " TTL="
                     + reservationTtlMillis + "ms 到期未结算，占用已退回窗口; 状态=EXPIRED，"
-                    + "迟到结算将被拒绝(触发者 requestId=" + requestId + ")";
+                    + "迟到结算将被拒绝(释放来源=" + trigger + ", 触发者 requestId="
+                    + requestId + ")";
             auditLogger.log(auditLogger.newEvent(AuditEvent.Kind.RESERVATION_EXPIRED,
                     requestId, tenantId, DecisionReason.RESERVATION_EXPIRED, r.policyVersion(),
                     basis));
         }
+    }
+
+    /**
+     * 后台定时扫描入口：不等任何后续请求，主动把各租户到期未结算的占用释放回当前窗口。
+     *
+     * <p>与请求路径的惰性扫描共用同一把租户锁、同一套过期规则（{@code now >= expiresAt}
+     * 即失效），因此同一笔占用无论被哪条路径先扫到都只释放一次，不会重复退回；
+     * 已结算记录为终态，绝不被本扫描误伤。释放与并发进来的预占/结算/普通判定在同一把
+     * 租户锁内串行，互不干扰、不会超发。</p>
+     *
+     * @return 本次扫描实际释放的占用笔数
+     */
+    public int sweepExpiredReservations() {
+        long now = clock.now().toEpochMilli();
+        int released = 0;
+        for (TenantState state : tenantStates.values()) {
+            List<ReservationRecord> expired;
+            synchronized (state) {
+                expired = state.expireOverdueReservations(now);
+            }
+            if (!expired.isEmpty()) {
+                released += expired.size();
+                auditExpired(AUTO_SWEEP_REQUEST_ID, state.tenantId(), expired, "后台定时扫描");
+            }
+        }
+        return released;
     }
 
     private ReservationResult reservationDegraded(String requestId, String tenantId, String key,
@@ -556,8 +592,12 @@ public class QuotaLimitEngine {
             return Optional.empty();
         }
         Map<String, Object> view = new LinkedHashMap<>();
+        List<ReservationRecord> expired;
+        long now = clock.now().toEpochMilli();
         synchronized (state) {
-            long now = clock.now().toEpochMilli();
+            // 读视图前在同一租户锁内先扫描到期占用：保证"已用量"与"在途占用"两个数
+            // 在任何时刻自洽，不会出现无在途占用却仍显示已用的情况
+            expired = state.expireOverdueReservations(now);
             view.put("tenantId", state.tenantId());
             view.put("tokens", state.currentTokens());
             view.put("quotaUsed", state.quotaUsed());
@@ -565,6 +605,7 @@ public class QuotaLimitEngine {
             view.put("activeReservationCount", state.activeReservationCount(now));
             view.put("activeReservedAmount", state.activeReservedAmount(now));
         }
+        auditExpired("admin-describe", tenantId, expired, "管理端查看时顺带扫描");
         return Optional.of(view);
     }
 

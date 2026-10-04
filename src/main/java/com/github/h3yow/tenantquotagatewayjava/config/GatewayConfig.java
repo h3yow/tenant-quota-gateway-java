@@ -7,11 +7,13 @@ import com.github.h3yow.tenantquotagatewayjava.limit.QuotaLimitEngine;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.scheduling.annotation.EnableScheduling;
 
 /**
  * 网关 Bean 装配。
  */
 @Configuration
+@EnableScheduling
 @EnableConfigurationProperties(GatewayProperties.class)
 public class GatewayConfig {
 
